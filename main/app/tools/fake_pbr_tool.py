@@ -6,7 +6,7 @@ material set with proper Phong, envmap masking, and VTF encoding.
 """
 
 import os
-from typing import Optional, Dict, Tuple, Callable, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import numpy as np
 from pathlib import Path
@@ -21,8 +21,24 @@ from PySide6.QtWidgets import (
     QSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor, QBrush
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event
+
+
+_ROW_OK_BRUSH = QBrush(QColor(76, 175, 80, 90))
+_ROW_FAIL_BRUSH = QBrush(QColor(244, 67, 54, 90))
+
+
+def _paint_table_row(table, row: int, success: bool) -> None:
+    """Tint every QTableWidgetItem in `row` to indicate completion status."""
+    if row < 0 or row >= table.rowCount():
+        return
+    brush = _ROW_OK_BRUSH if success else _ROW_FAIL_BRUSH
+    for col in range(table.columnCount()):
+        item = table.item(row, col)
+        if item is not None:
+            item.setBackground(brush)
 
 from .base_tool import BaseTool
 from ..utils.vtf_encoder import VTFEncoder, VTFEncoderError
@@ -80,6 +96,16 @@ class ProcessingOptions:
     # Scales the phong mask (bump alpha) and phong exponent map.
     # 0.5 halves the prior unscaled output, which read too hot in-engine.
     phong_strength: float = 0.5
+    # How the phong mask compensates for $phongalbedotint at runtime.
+    # "off"        — original behaviour, no compensation.
+    # "selective"  — colored-metal pixels are boosted via divide-by-luminance,
+    #                dielectric pixels are suppressed (envmap handles their spec).
+    # "blanket"    — divide-by-luminance everywhere.
+    phong_tint_mode: str = "selective"
+    # Per-pixel relief on metal_diffuse_suppression for chromatic metals
+    # (gold/copper/brass) so they retain saturation in the basetexture and
+    # provide a brighter source for $phongalbedotint to multiply.
+    colored_metal_relief: float = 0.5
     # Transparency mode. translucent → $translucent 1; alphatest → $alphatest 1
     # with $alphatestreference. Mutually exclusive (translucent wins if both).
     translucent: bool = False
@@ -215,6 +241,17 @@ class FakePBRProcessor:
             self.log(f"  → Darkening metallic diffuse regions")
             if translucency_data is not None:
                 self.log(f"  → Baking opacity into base texture alpha")
+            # Determine whether the target VMT will emit $phongalbedotint, in
+            # which case we run the matching tint-aware mask compensation.
+            from ..utils.vmt_generator import SOURCE1_TARGET_CAPABILITIES as _S1_CAPS
+            target_caps = _S1_CAPS.get(self.options.target_branch, _S1_CAPS.get("hl2", {}))
+            tint_mode_active = self.options.phong_tint_mode if target_caps.get("phong_albedo_tint", False) else "off"
+            if self.options.phong_tint_mode != "off" and tint_mode_active == "off":
+                self.log(
+                    f"  ℹ Target '{self.options.target_branch}' lacks $phongalbedotint; "
+                    f"phong tint mode forced off."
+                )
+
             base_texture = process_fakepbr_base_texture(
                 color_data,
                 ao_data,
@@ -222,25 +259,30 @@ class FakePBRProcessor:
                 self.options.ao_strength,
                 self.options.metal_diffuse_suppression,
                 translucency=translucency_data,
+                colored_metal_relief=self.options.colored_metal_relief if tint_mode_active != "off" else 0.0,
             )
             self.log(f"  ✓ Base texture processed")
             self._check_cancel()
-            
+
             # Process normal map
             self.log(f"[FakePBR] Packing normal map...")
             self.log(f"  → Preserving RGB normal channels")
-            self.log(f"  → Computing bump alpha Phong mask")
+            self.log(f"  → Computing bump alpha Phong mask (tint mode: {tint_mode_active})")
             normal_texture = pack_normal_with_phong_mask(
                 normal_data,
                 ao_data,
                 metallic_data,
                 roughness_data,
                 self.options.invert_green,
-                phong_strength=self.options.phong_strength
+                phong_strength=self.options.phong_strength,
+                color=color_data if tint_mode_active != "off" else None,
+                tint_mode=tint_mode_active,
+                metal_diffuse_suppression=self.options.metal_diffuse_suppression,
+                colored_metal_relief=self.options.colored_metal_relief if tint_mode_active != "off" else 0.0,
             )
             self.log(f"  ✓ Normal map packed with Phong mask in alpha")
             self._check_cancel()
-            
+
             # Process phong/gloss map
             self.log(f"[FakePBR] Computing phong exponent texture...")
             self.log(f"  → Converting roughness to gloss: (1-r)^{self.options.gloss_gamma:.2f}")
@@ -318,6 +360,7 @@ class FakePBRProcessor:
                     stats=stats,
                     has_envmap_mask=True,
                     custom_params=custom_params or None,
+                    tint_mode_used=tint_mode_active,
                 )
                 self.log(f"  ✓ Generated {material_name}.vmt")
             else:
@@ -392,11 +435,15 @@ class AutomationThread(QThread):
 
     progress = Signal(str)
     finished = Signal(bool, str)
+    row_finished = Signal(int, bool)
 
     def __init__(self, processor_factory, tasks, max_workers: int = 2):
         super().__init__()
         self.processor_factory = processor_factory  # function to create a FakePBRProcessor
-        self.tasks = tasks  # list of dicts with inputs, output_folder, material_name, material_path
+        # Each task is a dict that may include a 'row' key carrying the
+        # originating QTableWidget row index so the UI can paint per-row
+        # completion status without depending on submission order.
+        self.tasks = tasks
         self.max_workers = max(1, int(max_workers))
 
     def run(self):
@@ -406,7 +453,7 @@ class AutomationThread(QThread):
 
         def worker(idx: int, task: dict):
             if self.isInterruptionRequested():
-                return (idx, task['material_name'], False, 'Cancelled')
+                return (idx, task['material_name'], False, 'Cancelled', task.get('row', -1))
             proc = self.processor_factory()
             # Prefix all logs from this task with its index/total
             proc.log_callback = lambda m, i=idx, t=total: self.progress.emit(f"[{i}/{t}] {m}")
@@ -426,7 +473,7 @@ class AutomationThread(QThread):
                     proc.shutdown()
                 except Exception:
                     pass
-            return (idx, task['material_name'], success, msg)
+            return (idx, task['material_name'], success, msg, task.get('row', -1))
 
         # Submit tasks to a thread pool with a bounded number of workers
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -435,7 +482,7 @@ class AutomationThread(QThread):
                 if self.isInterruptionRequested():
                     cancelled = True
                     break
-                futures[executor.submit(worker, idx, task)] = (idx, task['material_name'])
+                futures[executor.submit(worker, idx, task)] = (idx, task['material_name'], task.get('row', -1))
 
             # Process completions as they finish
             for future in as_completed(futures):
@@ -443,9 +490,9 @@ class AutomationThread(QThread):
                     cancelled = True
                     break
                 try:
-                    idx, name, success, msg = future.result()
+                    idx, name, success, msg, row = future.result()
                 except Exception as e:
-                    idx, name = futures[future]
+                    idx, name, row = futures[future]
                     success = False
                     msg = f"Processing Error: {e}"
                 if success:
@@ -456,6 +503,8 @@ class AutomationThread(QThread):
                     if isinstance(msg, str) and msg.lower().startswith("cancelled"):
                         cancelled = True
                     self.progress.emit(f"[{idx}/{total}] ✗ {name} failed: {msg}")
+                if row >= 0:
+                    self.row_finished.emit(row, success)
 
         if cancelled or self.isInterruptionRequested():
             self.finished.emit(False, f"Cancelled after {ok_count}/{total} materials")
@@ -633,6 +682,41 @@ class FakePBRTool(BaseTool):
         phong_layout.addWidget(self.phong_strength_slider)
         phong_layout.addWidget(self.phong_strength_value)
         options_layout.addRow("Phong Strength:", phong_layout)
+
+        # Phong Tint Mode
+        self.phong_tint_mode_combo = QComboBox()
+        self.phong_tint_mode_combo.addItem("Off", "off")
+        self.phong_tint_mode_combo.addItem("Selective (recommended)", "selective")
+        self.phong_tint_mode_combo.addItem("Blanket", "blanket")
+        self.phong_tint_mode_combo.setCurrentIndex(1)
+        self.phong_tint_mode_combo.setToolTip(
+            "Compensates the phong mask for $phongalbedotint runtime tinting. "
+            "Off: original behaviour. Selective: only colored metals are boosted, "
+            "dielectric phong is suppressed (envmap handles their spec). "
+            "Blanket: divide-by-luminance compensation everywhere. "
+            "Has no effect on targets that don't support $phongalbedotint (hl2, source2013_sp)."
+        )
+        options_layout.addRow("Phong Tint Mode:", self.phong_tint_mode_combo)
+
+        # Colored Metal Relief
+        relief_layout = QHBoxLayout()
+        self.colored_metal_relief_slider = QSlider(Qt.Horizontal)
+        self.colored_metal_relief_slider.setRange(0, 100)
+        self.colored_metal_relief_slider.setValue(50)
+        self.colored_metal_relief_slider.setToolTip(
+            "Per-pixel relief on Metal Diffuse Suppression for chromatic metals. "
+            "0.00 = uniform suppression (current behaviour). "
+            "1.00 = fully-saturated metals receive no diffuse darkening, so colors "
+            "like gold/copper/brass stay bright for $phongalbedotint to multiply. "
+            "Only applied when Phong Tint Mode is not Off."
+        )
+        self.colored_metal_relief_value = QLabel("0.50")
+        self.colored_metal_relief_slider.valueChanged.connect(
+            lambda v: self.colored_metal_relief_value.setText(f"{v/100:.2f}")
+        )
+        relief_layout.addWidget(self.colored_metal_relief_slider)
+        relief_layout.addWidget(self.colored_metal_relief_value)
+        options_layout.addRow("Colored Metal Relief:", relief_layout)
 
         # Generate VTF checkbox
         self.generate_vtf_checkbox = QCheckBox("Generate VTF")
@@ -824,6 +908,35 @@ class FakePBRTool(BaseTool):
         auto_phong_row.addWidget(self.auto_phong_strength_value)
         auto_opt_form.addRow("Phong Strength:", self._row_widget(auto_phong_row))
 
+        # Phong Tint Mode (auto)
+        self.auto_phong_tint_mode_combo = QComboBox()
+        self.auto_phong_tint_mode_combo.addItem("Off", "off")
+        self.auto_phong_tint_mode_combo.addItem("Selective (recommended)", "selective")
+        self.auto_phong_tint_mode_combo.addItem("Blanket", "blanket")
+        self.auto_phong_tint_mode_combo.setCurrentIndex(1)
+        self.auto_phong_tint_mode_combo.setToolTip(
+            "Compensates the phong mask for $phongalbedotint runtime tinting. "
+            "Selective is recommended for mixed metal/dielectric materials."
+        )
+        auto_opt_form.addRow("Phong Tint Mode:", self.auto_phong_tint_mode_combo)
+
+        # Colored Metal Relief (auto)
+        auto_relief_row = QHBoxLayout()
+        self.auto_colored_metal_relief_slider = QSlider(Qt.Horizontal)
+        self.auto_colored_metal_relief_slider.setRange(0, 100)
+        self.auto_colored_metal_relief_slider.setValue(50)
+        self.auto_colored_metal_relief_slider.setToolTip(
+            "Per-pixel relief on Metal Diffuse Suppression for chromatic metals. "
+            "Only applied when Phong Tint Mode is not Off."
+        )
+        self.auto_colored_metal_relief_value = QLabel("0.50")
+        self.auto_colored_metal_relief_slider.valueChanged.connect(
+            lambda v: self.auto_colored_metal_relief_value.setText(f"{v/100:.2f}")
+        )
+        auto_relief_row.addWidget(self.auto_colored_metal_relief_slider)
+        auto_relief_row.addWidget(self.auto_colored_metal_relief_value)
+        auto_opt_form.addRow("Colored Metal Relief:", self._row_widget(auto_relief_row))
+
         # Generate VTF
         self.auto_generate_vtf = QCheckBox("Generate VTF")
         self.auto_generate_vtf.setChecked(True)
@@ -857,6 +970,35 @@ class FakePBRTool(BaseTool):
 
         auto_options.setLayout(auto_opt_form)
         automate_layout.addWidget(auto_options)
+
+        # Requirements: which texture types must be present for a row to be
+        # processed. Color/Normal default on (matching today's hardcoded
+        # validation); AO/Roughness/Metallic default off so existing scans
+        # behave as before. Toggling any checkbox re-applies live to the
+        # results table — rows missing a required type get auto-unchecked.
+        req_group = QGroupBox("Requirements")
+        req_layout = QHBoxLayout()
+        req_layout.setContentsMargins(8, 6, 8, 6)
+        self.req_checkboxes: Dict[str, QCheckBox] = {}
+        for label, key, default in (
+            ("Color", "color", True),
+            ("Normal", "normal", True),
+            ("AO", "ao", False),
+            ("Roughness", "roughness", False),
+            ("Metallic", "metallic", False),
+        ):
+            cb = QCheckBox(label)
+            cb.setChecked(default)
+            cb.setToolTip(
+                f"Require a {label.lower()} map for a material to be processed. "
+                f"Rows missing this map will be auto-unchecked in the table."
+            )
+            cb.stateChanged.connect(self._apply_requirements_filter)
+            req_layout.addWidget(cb)
+            self.req_checkboxes[key] = cb
+        req_layout.addStretch()
+        req_group.setLayout(req_layout)
+        automate_layout.addWidget(req_group)
 
         # Results table
         self.scan_table = QTableWidget(0, 7)
@@ -1036,12 +1178,22 @@ class FakePBRTool(BaseTool):
             ao_val = float(opts.get('ao_strength', 0.5))
             gamma_val = float(opts.get('gloss_gamma', 2.2))
             metal_supp_val = float(opts.get('metal_diffuse_suppression', 0.7))
+            relief_val = float(opts.get('colored_metal_relief', 0.5))
             self.auto_ao_slider.setValue(int(ao_val * 100))
             self.auto_gamma_slider.setValue(int(gamma_val * 10))
             self.auto_metal_suppression_slider.setValue(int(metal_supp_val * 100))
+            self.auto_colored_metal_relief_slider.setValue(int(relief_val * 100))
+            tint_mode_val = str(opts.get('phong_tint_mode', 'selective'))
+            tint_idx = self.auto_phong_tint_mode_combo.findData(tint_mode_val)
+            if tint_idx >= 0:
+                self.auto_phong_tint_mode_combo.setCurrentIndex(tint_idx)
             self.auto_generate_vtf.setChecked(bool(opts.get('generate_vtf', True)))
             self.auto_generate_vmt.setChecked(bool(opts.get('generate_vmt', True)))
             self.auto_generate_mipmaps.setChecked(bool(opts.get('generate_mipmaps', True)))
+            reqs = opts.get('requirements') or {}
+            for key, cb in self.req_checkboxes.items():
+                if key in reqs:
+                    cb.setChecked(bool(reqs[key]))
         except Exception:
             pass
 
@@ -1075,9 +1227,15 @@ class FakePBRTool(BaseTool):
             ao_val = float(options.get('ao_strength', 0.5))
             gamma_val = float(options.get('gloss_gamma', 2.2))
             metal_supp_val = float(options.get('metal_diffuse_suppression', 0.7))
+            relief_val = float(options.get('colored_metal_relief', 0.5))
             self.ao_strength_slider.setValue(int(ao_val * 100))
             self.gloss_gamma_slider.setValue(int(gamma_val * 10))
             self.metal_suppression_slider.setValue(int(metal_supp_val * 100))
+            self.colored_metal_relief_slider.setValue(int(relief_val * 100))
+            tint_mode_val = str(options.get('phong_tint_mode', 'selective'))
+            tint_idx = self.phong_tint_mode_combo.findData(tint_mode_val)
+            if tint_idx >= 0:
+                self.phong_tint_mode_combo.setCurrentIndex(tint_idx)
             self.generate_vtf_checkbox.setChecked(bool(options.get('generate_vtf', True)))
             self.generate_mipmaps_checkbox.setChecked(bool(options.get('generate_mipmaps', True)))
             self.generate_vmt_checkbox.setChecked(bool(options.get('generate_vmt', True)))
@@ -1112,6 +1270,8 @@ class FakePBRTool(BaseTool):
                 'ao_strength': options.ao_strength,
                 'gloss_gamma': options.gloss_gamma,
                 'metal_diffuse_suppression': options.metal_diffuse_suppression,
+                'phong_tint_mode': options.phong_tint_mode,
+                'colored_metal_relief': options.colored_metal_relief,
                 'generate_vtf': options.generate_vtf,
                 'generate_vmt': options.generate_vmt,
                 'generate_mipmaps': options.generate_mipmaps
@@ -1151,9 +1311,12 @@ class FakePBRTool(BaseTool):
             'ao_strength': self.auto_ao_slider.value() / 100.0,
             'gloss_gamma': self.auto_gamma_slider.value() / 10.0,
             'metal_diffuse_suppression': self.auto_metal_suppression_slider.value() / 100.0,
+            'phong_tint_mode': self.auto_phong_tint_mode_combo.currentData() or 'selective',
+            'colored_metal_relief': self.auto_colored_metal_relief_slider.value() / 100.0,
             'generate_vtf': self.auto_generate_vtf.isChecked(),
             'generate_vmt': self.auto_generate_vmt.isChecked(),
             'generate_mipmaps': self.auto_generate_mipmaps.isChecked(),
+            'requirements': {key: cb.isChecked() for key, cb in self.req_checkboxes.items()},
         }
         label = self.auto_input_folder.text() or self.auto_output_folder.text() or ''
         return {
@@ -1219,6 +1382,8 @@ class FakePBRTool(BaseTool):
             gloss_gamma=self.gloss_gamma_slider.value() / 10.0,
             metal_diffuse_suppression=self.metal_suppression_slider.value() / 100.0,
             phong_strength=self.phong_strength_slider.value() / 100.0,
+            phong_tint_mode=self.phong_tint_mode_combo.currentData() or "selective",
+            colored_metal_relief=self.colored_metal_relief_slider.value() / 100.0,
             generate_vtf=self.generate_vtf_checkbox.isChecked(),
             generate_vmt=self.generate_vmt_checkbox.isChecked(),
             generate_mipmaps=self.generate_mipmaps_checkbox.isChecked()
@@ -1442,8 +1607,12 @@ class FakePBRTool(BaseTool):
                         break
         # Populate table
         self._populate_scan_table(matches)
+        excluded = self._apply_requirements_filter()
         self.process_all_button.setEnabled(self.scan_table.rowCount() > 0)
-        self.log(f"Scan complete: {len(matches)} material sets detected from {count_files} files", "INFO")
+        msg = f"Scan complete: {len(matches)} material sets detected from {count_files} files"
+        if excluded:
+            msg += f" ({excluded} excluded by requirements)"
+        self.log(msg, "INFO")
 
     def _populate_scan_table(self, matches: dict):
         self.scan_table.setRowCount(0)
@@ -1511,6 +1680,8 @@ class FakePBRTool(BaseTool):
         gloss_gamma = self.auto_gamma_slider.value() / 10.0
         metal_suppression = self.auto_metal_suppression_slider.value() / 100.0
         phong_strength = self.auto_phong_strength_slider.value() / 100.0
+        phong_tint_mode = self.auto_phong_tint_mode_combo.currentData() or "selective"
+        colored_metal_relief = self.auto_colored_metal_relief_slider.value() / 100.0
         gen_vmt = self.auto_generate_vmt.isChecked()
 
         gen_vtf = self.auto_generate_vtf.isChecked()
@@ -1547,11 +1718,14 @@ class FakePBRTool(BaseTool):
                 'output_folder': out_dir,
                 'material_name': material_name,
                 'material_path': mat_path,
+                'row': row,
                 'options': ProcessingOptions(
                     ao_strength=ao_strength,
                     gloss_gamma=gloss_gamma,
                     metal_diffuse_suppression=metal_suppression,
                     phong_strength=phong_strength,
+                    phong_tint_mode=phong_tint_mode,
+                    colored_metal_relief=colored_metal_relief,
                     generate_vtf=gen_vtf,
                     generate_vmt=gen_vmt,
                     generate_mipmaps=self.auto_generate_mipmaps.isChecked()
@@ -1582,6 +1756,8 @@ class FakePBRTool(BaseTool):
                 gloss_gamma=gloss_gamma,
                 metal_diffuse_suppression=metal_suppression,
                 phong_strength=phong_strength,
+                phong_tint_mode=phong_tint_mode,
+                colored_metal_relief=colored_metal_relief,
                 generate_vtf=gen_vtf,
                 generate_vmt=gen_vmt,
                 generate_mipmaps=self.auto_generate_mipmaps.isChecked()
@@ -1590,8 +1766,48 @@ class FakePBRTool(BaseTool):
 
         self.automation_thread = AutomationThread(make_processor, tasks, max_workers=self.auto_max_parallel.value())
         self.automation_thread.progress.connect(lambda m: self.log(m, "INFO"))
+        self.automation_thread.row_finished.connect(self._on_scan_row_finished)
         self.automation_thread.finished.connect(self.on_automation_finished)
         self.automation_thread.start()
+
+    def _on_scan_row_finished(self, row: int, success: bool):
+        """Tint the corresponding scan_table row green/red as each task completes."""
+        _paint_table_row(self.scan_table, row, success)
+
+    def _required_types(self) -> List[str]:
+        """Texture types currently required for a material to be eligible."""
+        if not hasattr(self, "req_checkboxes"):
+            return []
+        return [key for key, cb in self.req_checkboxes.items() if cb.isChecked()]
+
+    def _apply_requirements_filter(self) -> int:
+        """Auto-uncheck rows whose underlying data is missing any required type.
+
+        Returns the count of rows that ended up unchecked because they failed
+        the current requirement set. Re-checking a row manually is still
+        allowed; the filter only fires on requirement-toggle and post-scan.
+        """
+        if not hasattr(self, "scan_table") or not getattr(self, "_scan_matches", None):
+            return 0
+        required = self._required_types()
+        if not required:
+            return 0
+        excluded = 0
+        for row in range(self.scan_table.rowCount()):
+            name_item = self.scan_table.item(row, 1)
+            include_item = self.scan_table.item(row, 0)
+            if name_item is None or include_item is None:
+                continue
+            data = self._scan_matches.get(name_item.text(), {})
+            missing = [t for t in required if not data.get(t)]
+            if missing:
+                if include_item.checkState() == Qt.Checked:
+                    include_item.setCheckState(Qt.Unchecked)
+                include_item.setToolTip("Missing required: " + ", ".join(missing))
+                excluded += 1
+            else:
+                include_item.setToolTip("")
+        return excluded
 
     def on_automation_finished(self, success: bool, message: str):
         self.log(message, "SUCCESS" if success else "WARNING")
