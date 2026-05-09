@@ -8,11 +8,14 @@ Builds `main.py` into a Windows executable and bundles runtime resources.
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.util
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 APP_NAME = "Source 2 Porting Kit"
@@ -59,11 +62,79 @@ def install_requirements() -> None:
     _run([sys.executable, "-m", "pip", "install", "-r", str(requirements_file)])
 
 
+def _on_rmtree_error(func, path, _exc):
+    """rmtree onexc handler that clears the read-only bit and retries.
+
+    PyInstaller's bundled `.pyd` and `.dll` files are sometimes written
+    read-only, which makes Windows refuse to delete them on the first try.
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+    func(path)
+
+
+def _robust_rmtree(path: Path, *, retries: int = 5, delay: float = 0.5) -> None:
+    """Delete a directory tree on Windows, retrying transient lock errors.
+
+    File handles released by another process (or AV scanners) are typically
+    cleared within a second or two. If the path is still locked after
+    `retries` attempts, raise a clear error pointing at the locked file —
+    the most common cause is that a previous build of the EXE is still
+    running.
+    """
+    if not path.exists():
+        return
+
+    last_error: BaseException | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            shutil.rmtree(path, onexc=_on_rmtree_error)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            locked = exc.filename or path
+            print(
+                f"  Retry {attempt}/{retries}: could not delete {locked} "
+                f"(locked or in use). Waiting {delay:.1f}s..."
+            )
+            time.sleep(delay)
+            delay *= 2  # exponential backoff
+        except OSError as exc:
+            # ENOTEMPTY / similar — give the same retry treatment.
+            if exc.errno not in (errno.EACCES, errno.EBUSY, errno.ENOTEMPTY):
+                raise
+            last_error = exc
+            time.sleep(delay)
+            delay *= 2
+
+    locked = getattr(last_error, "filename", None) or path
+    raise RuntimeError(
+        f"Failed to delete {locked} after {retries} attempts.\n"
+        "This usually means a previous build of the app is still running, "
+        "or an antivirus is scanning the dist folder. Close any running "
+        f"'{APP_NAME}.exe' instances and try again."
+    ) from last_error
+
+
 def clean_build_outputs() -> None:
     for path in (SCRIPT_DIR / "build", SCRIPT_DIR / "dist"):
         if path.exists():
             print(f"Removing {path} ...")
-            shutil.rmtree(path)
+            _robust_rmtree(path)
+
+
+def clean_dist_only() -> None:
+    """Remove only the dist/ tree so PyInstaller can repopulate it.
+
+    Preserves build/work/ (PyInstaller's analysis cache), which makes
+    re-runs an order of magnitude faster.
+    """
+    dist = SCRIPT_DIR / "dist"
+    if dist.exists():
+        print(f"Removing {dist} ...")
+        _robust_rmtree(dist)
 
 
 def ensure_build_dirs() -> None:
@@ -89,7 +160,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
         str(SCRIPT_DIR / "build" / "spec"),
     ]
 
-    if not args.no_clean:
+    if args.clean:
         cmd.append("--clean")
 
     cmd.append("--onefile" if args.onefile else "--onedir")
@@ -108,8 +179,6 @@ def build_command(args: argparse.Namespace) -> list[str]:
     # Dependencies that are frequently missed by static analysis or require
     # packaged resources/binaries.
     hidden_imports = [
-        "ffmpeg",         # ffmpeg-python (imported inside methods)
-        "pydub",          # imported lazily in audio tools
         "sourcepp.vtfpp", # native-backed module used for VTF work
     ]
     for module_name in hidden_imports:
@@ -132,14 +201,10 @@ def build_command(args: argparse.Namespace) -> list[str]:
 def print_runtime_warnings() -> None:
     warnings: list[str] = []
 
-    if not _has_module("pydub"):
+    if shutil.which("ffmpeg") is None:
         warnings.append(
-            "Optional package 'pydub' is not installed. OGG/Quad audio tools will be unavailable in the built app."
-        )
-
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        warnings.append(
-            "ffmpeg/ffprobe executables were not found on PATH. Audio conversion tools may fail at runtime."
+            "ffmpeg executable was not found on PATH. Audio conversion tools (OGG converter, "
+            "loop point, quad-to-stereo) will fail at runtime."
         )
 
     if warnings:
@@ -156,12 +221,32 @@ def output_exe_path(app_name: str, onefile: bool) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Source 2 Porting Kit executable")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build Source 2 Porting Kit executable. By default the build is "
+            "incremental: dependencies are NOT reinstalled and PyInstaller's "
+            "analysis cache is reused, so re-runs are ~10x faster than a full "
+            "rebuild. Pass --clean for a full rebuild, --install-deps to refresh "
+            "Python packages."
+        )
+    )
     parser.add_argument("--onefile", action="store_true", help="Build a single-file executable (slower startup)")
     parser.add_argument("--console", action="store_true", help="Show console window for debugging")
     parser.add_argument("--debug", action="store_true", help="Enable PyInstaller debug mode")
-    parser.add_argument("--no-clean", action="store_true", help="Do not remove previous build/dist output")
-    parser.add_argument("--no-deps", action="store_true", help="Skip pip install for requirements and PyInstaller")
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Wipe build/ and dist/ before building and pass --clean to PyInstaller (forces full rebuild)",
+    )
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="Run pip install for PyInstaller and requirements.txt before building",
+    )
+    # Back-compat aliases (silently accepted; current defaults already match
+    # what these flags used to request).
+    parser.add_argument("--no-clean", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-deps", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--name", default=APP_NAME, help=f"Executable name (default: {APP_NAME})")
     return parser.parse_args()
 
@@ -179,12 +264,21 @@ def main() -> int:
     print(f"Mode: {'onefile' if args.onefile else 'onedir'}")
 
     try:
-        if not args.no_deps:
+        # PyInstaller is required either way; quietly verify the import
+        # without invoking pip when the package is already present.
+        if args.install_deps:
             ensure_pyinstaller_installed()
             install_requirements()
+        elif not _has_module("PyInstaller"):
+            ensure_pyinstaller_installed()
 
-        if not args.no_clean:
+        if args.clean:
+            # Full rebuild: wipe everything and let PyInstaller redo analysis.
             clean_build_outputs()
+        else:
+            # Incremental rebuild: only the previous app folder needs to go;
+            # keep build/work/ so PyInstaller can reuse its analysis cache.
+            clean_dist_only()
 
         ensure_build_dirs()
 

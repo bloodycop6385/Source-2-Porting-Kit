@@ -184,6 +184,16 @@ def generate_fakepbr_vmt(
         ("Phong", ["\"$phong\"", "\"$phongboost\"", "\"$phongexponentfactor\"", "\"$phongtint\"", "\"$phongalbedotint\"", "\"$phongfresnelranges\""]),
         ("Environment Map", ["\"$envmap\"", "\"$envmapmask\"", "\"$envmaptint\"", "\"$envmapcontrast\"", "\"$envmapsaturation\"", "\"$envmapfresnel\"", "\"$normalmapalphaenvmapmask\"", "\"$envmaplightscale\""]),
         ("Rimlight", ["\"$rimlight\"", "\"$rimlightexponent\"", "\"$rimlightboost\"", "\"$rimmask\""]),
+        ("Self-Illumination", ["\"$selfillum\"", "\"$selfillummask\"", "\"$selfillumtint\"", "\"$selfillummaskscale\""]),
+        ("Emissive Blend", [
+            "\"$EmissiveBlendEnabled\"",
+            "\"$EmissiveBlendStrength\"",
+            "\"$EmissiveBlendTexture\"",
+            "\"$EmissiveBlendBaseTexture\"",
+            "\"$EmissiveBlendFlowTexture\"",
+            "\"$EmissiveBlendTint\"",
+            "\"$EmissiveBlendScrollVector\"",
+        ]),
         ("Surface", ["\"$halflambert\"", "\"$model\""]),
     ]
 
@@ -462,7 +472,7 @@ def generate_unlit_vmt(output_path: str, base_texture_path: str) -> bool:
     params = {
         "\"$basetexture\"": base_texture_path,
         "\"$model\"": "1",
-        "\"$nocull\"": "1",
+        "\"$nocull\"": "0",
         "\"$selfillum\"": "1"
     }
     
